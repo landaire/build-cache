@@ -1,0 +1,111 @@
+name: Connect Buck2 to the build cache
+description: >-
+  Joins the tailnet as an ephemeral tag:ci device and points Buck2 at the
+  cache. Run it after .buckconfig.local is written. Pull requests, jobs
+  without a configured Tailscale identity or a GitHub OIDC token, and jobs
+  that cannot reach the cache build without it, and the job continues.
+inputs:
+  client-id:
+    description: The client ID of the repository's Tailscale federated identity. Empty skips the cache.
+    default: ""
+  audience:
+    description: The audience of that federated identity. Empty skips the cache.
+    default: ""
+  host:
+    description: The cache's tailnet machine name.
+    default: buck-cache
+  port:
+    description: The cache's gRPC port.
+    default: "50051"
+  buckconfig:
+    description: The Buck2 config file the cache section is appended to.
+    default: .buckconfig.local
+outputs:
+  enabled:
+    description: Whether Buck2 was pointed at the cache.
+    value: ${{ steps.configure.outputs.enabled }}
+runs:
+  using: composite
+  steps:
+    # Any job that joins can write to the cache, so only pushes and manual runs
+    # by people with write access join. GitHub issues an OIDC token only to
+    # jobs granted id-token: write, and never to a pull request from a fork.
+    - name: Check for credentials
+      id: credentials
+      shell: bash
+      env:
+        CLIENT_ID: ${{ inputs.client-id }}
+        AUDIENCE: ${{ inputs.audience }}
+      run: |
+        case "$GITHUB_EVENT_NAME" in
+          pull_request*)
+            echo "Pull requests build without the cache, because their code could write to it."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+            ;;
+        esac
+        if [ -z "$CLIENT_ID" ] || [ -z "$AUDIENCE" ]; then
+          echo "No Tailscale identity is configured, so the build runs without the cache."
+          echo "present=false" >> "$GITHUB_OUTPUT"
+        elif [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "No OIDC token, so the build runs without the cache."
+          echo "present=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "present=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Join the tailnet
+      id: tailscale
+      if: steps.credentials.outputs.present == 'true'
+      continue-on-error: true
+      uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
+      with:
+        oauth-client-id: ${{ inputs.client-id }}
+        audience: ${{ inputs.audience }}
+        tags: tag:ci
+        ping: ${{ inputs.host }}
+
+    - name: Point Buck2 at the cache
+      id: configure
+      shell: bash
+      env:
+        PRESENT: ${{ steps.credentials.outputs.present }}
+        JOINED: ${{ steps.tailscale.outcome }}
+        HOST: ${{ inputs.host }}
+        PORT: ${{ inputs.port }}
+        BUCKCONFIG: ${{ inputs.buckconfig }}
+      run: |
+        skip() {
+          echo "::warning::$1, so the build runs without the cache."
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        }
+        if [ "$PRESENT" != true ]; then
+          echo "enabled=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        [ "$JOINED" = success ] || skip "Could not join the tailnet"
+
+        # The address, not the name, so the config does not depend on how each
+        # runner resolves MagicDNS names.
+        address=$(tailscale ip -4 "$HOST" 2>/dev/null) || skip "No tailnet address for $HOST"
+        [ -n "$address" ] || skip "No tailnet address for $HOST"
+
+        # Buck2 fails every action when the cache it is pointed at does not
+        # answer, so check the service as well as the machine. curl is on every
+        # runner, including Git Bash on Windows.
+        curl -fsS --max-time 10 -o /dev/null "http://$address:$PORT/status" \
+          || skip "$HOST does not answer on port $PORT"
+
+        cat >> "$BUCKCONFIG" <<EOF
+
+        [buck2_re_client]
+        engine_address = grpc://$address:$PORT
+        action_cache_address = grpc://$address:$PORT
+        cas_address = grpc://$address:$PORT
+        tls = false
+
+        [buck2]
+        default_allow_cache_upload = true
+        EOF
+        echo "enabled=true" >> "$GITHUB_OUTPUT"
