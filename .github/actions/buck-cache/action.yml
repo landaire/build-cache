@@ -1,25 +1,29 @@
 name: Connect Buck2 to the build cache
 description: >-
-  Joins the tailnet as an ephemeral tag:ci device and points Buck2 at the
-  cache. Run it after .buckconfig.local is written. Pull requests, jobs
-  without a configured Tailscale identity or a GitHub OIDC token, and jobs
-  that cannot reach the cache build without it, and the job continues.
+  Joins the tailnet as an ephemeral device and points Buck2 at the cache.
+  Pushes and manual runs join as tag:ci and read and write the cache. Pull
+  requests join as tag:ci-pr and only read it. A job without the identity for
+  its event, without a GitHub OIDC token, or that cannot reach the cache
+  builds without it, and the job continues.
 inputs:
   client-id:
-    description: The client ID of the repository's Tailscale federated identity. Empty skips the cache.
+    description: The client ID of the Tailscale federated identity for pushes and manual runs. Empty skips the cache for them.
     default: ""
   audience:
-    description: The audience of that federated identity. Empty skips the cache.
+    description: The audience of that federated identity.
+    default: ""
+  pr-client-id:
+    description: The client ID of the Tailscale federated identity for pull requests. Empty skips the cache for them.
+    default: ""
+  pr-audience:
+    description: The audience of that federated identity.
     default: ""
   host:
     description: The cache's tailnet machine name.
     default: buck-cache
-  port:
-    description: The cache's gRPC port.
-    default: "50051"
   buckconfig:
-    description: The Buck2 config file the cache section is appended to.
-    default: .buckconfig.local
+    description: The Buck2 config file the cache section is appended to. Empty means $HOME/.buckconfig.d/30-build-cache.
+    default: ""
 outputs:
   enabled:
     description: Whether Buck2 was pointed at the cache.
@@ -27,54 +31,87 @@ outputs:
 runs:
   using: composite
   steps:
-    # Any job that joins can write to the cache, so only pushes and manual runs
-    # by people with write access join. GitHub issues an OIDC token only to
-    # jobs granted id-token: write, and never to a pull request from a fork.
-    - name: Check for credentials
-      id: credentials
+    # Pull request code runs in the job, so the job's Buck2 config does not
+    # stop it from writing. The tailnet policy admits tag:ci-pr only to the
+    # read-only port, and the server refuses writes there. A pull request
+    # therefore never uses the trusted identity, tag or port. Other events,
+    # such as merge_group, workflow_run and issue_comment, can run pull request
+    # code under a branch-form OIDC subject, so they get no cache. GitHub
+    # issues an OIDC token only to jobs granted id-token: write, and never to a
+    # pull request from a fork.
+    - name: Select the identity
+      id: identity
       shell: bash
       env:
         CLIENT_ID: ${{ inputs.client-id }}
         AUDIENCE: ${{ inputs.audience }}
+        PR_CLIENT_ID: ${{ inputs.pr-client-id }}
+        PR_AUDIENCE: ${{ inputs.pr-audience }}
       run: |
         case "$GITHUB_EVENT_NAME" in
           pull_request*)
-            echo "Pull requests build without the cache, because their code could write to it."
+            client_id=$PR_CLIENT_ID audience=$PR_AUDIENCE
+            tag=tag:ci-pr port=50052 upload=false
+            ;;
+          push | workflow_dispatch | schedule)
+            client_id=$CLIENT_ID audience=$AUDIENCE
+            tag=tag:ci port=50051 upload=true
+            ;;
+          *)
+            echo "Runs triggered by $GITHUB_EVENT_NAME build without the cache."
             echo "present=false" >> "$GITHUB_OUTPUT"
             exit 0
             ;;
         esac
-        if [ -z "$CLIENT_ID" ] || [ -z "$AUDIENCE" ]; then
-          echo "No Tailscale identity is configured, so the build runs without the cache."
+        if [ -z "$client_id" ] || [ -z "$audience" ]; then
+          echo "No Tailscale identity is configured for $GITHUB_EVENT_NAME, so the build runs without the cache."
           echo "present=false" >> "$GITHUB_OUTPUT"
         elif [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
           echo "No OIDC token, so the build runs without the cache."
           echo "present=false" >> "$GITHUB_OUTPUT"
         else
-          echo "present=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "present=true"
+            echo "client-id=$client_id"
+            echo "audience=$audience"
+            echo "tag=$tag"
+            echo "port=$port"
+            echo "upload=$upload"
+          } >> "$GITHUB_OUTPUT"
         fi
 
     - name: Join the tailnet
       id: tailscale
-      if: steps.credentials.outputs.present == 'true'
+      if: steps.identity.outputs.present == 'true'
       continue-on-error: true
       uses: tailscale/github-action@064b10558093f38325e838ddea35486bdc6b1d5c # v4.4.0
       with:
-        oauth-client-id: ${{ inputs.client-id }}
-        audience: ${{ inputs.audience }}
-        tags: tag:ci
+        oauth-client-id: ${{ steps.identity.outputs.client-id }}
+        audience: ${{ steps.identity.outputs.audience }}
+        tags: ${{ steps.identity.outputs.tag }}
         ping: ${{ inputs.host }}
 
     - name: Point Buck2 at the cache
       id: configure
       shell: bash
       env:
-        PRESENT: ${{ steps.credentials.outputs.present }}
+        PRESENT: ${{ steps.identity.outputs.present }}
         JOINED: ${{ steps.tailscale.outcome }}
         HOST: ${{ inputs.host }}
-        PORT: ${{ inputs.port }}
+        PORT: ${{ steps.identity.outputs.port }}
+        UPLOAD: ${{ steps.identity.outputs.upload }}
         BUCKCONFIG: ${{ inputs.buckconfig }}
       run: |
+        # The default file belongs to the action, so a disabled run removes one
+        # left by an earlier run on the same runner. A caller's file is only
+        # appended to.
+        if [ -n "$BUCKCONFIG" ]; then
+          buckconfig=$BUCKCONFIG
+        else
+          buckconfig=$HOME/.buckconfig.d/30-build-cache
+          rm -f "$buckconfig"
+        fi
+
         skip() {
           echo "::warning::$1, so the build runs without the cache."
           echo "enabled=false" >> "$GITHUB_OUTPUT"
@@ -97,7 +134,11 @@ runs:
         curl -fsS --max-time 10 -o /dev/null "http://$address:$PORT/status" \
           || skip "$HOST does not answer on port $PORT"
 
-        cat >> "$BUCKCONFIG" <<EOF
+        # A file of its own in the user config directory, so the action does
+        # not edit a project file the workflow also writes. Project configs
+        # take precedence over it.
+        mkdir -p "$(dirname "$buckconfig")"
+        cat >> "$buckconfig" <<EOF
 
         [buck2_re_client]
         engine_address = grpc://$address:$PORT
@@ -106,6 +147,6 @@ runs:
         tls = false
 
         [buck2]
-        default_allow_cache_upload = true
+        default_allow_cache_upload = $UPLOAD
         EOF
         echo "enabled=true" >> "$GITHUB_OUTPUT"

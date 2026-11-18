@@ -1,10 +1,11 @@
 # NativeLink as a cache only: a content-addressed store and an action cache,
 # with no scheduler or worker. Buck2 runs every action itself and reads and
-# writes results here. The port is reachable only over the tailnet.
+# writes results here. The ports are reachable only over the tailnet.
 { pkgs, nativelink, ... }:
 let
   stateDir = "/var/lib/nativelink";
-  port = 50051;
+  trustedPort = 50051;
+  pullRequestPort = 50052;
   # The Hetzner volume, formatted ext4 when it was created.
   volume = "/dev/disk/by-id/scsi-0HC_Volume_107514109";
 
@@ -20,6 +21,35 @@ let
       evict_bytes = bytes / 10;
     };
   };
+
+  server =
+    {
+      name,
+      port,
+      cas,
+      acReadOnly,
+    }:
+    {
+      inherit name;
+      listener.http = {
+        socket_address = "0.0.0.0:${toString port}";
+        # Clients are about 100 ms away. A fixed window caps each upload
+        # stream at window / RTT, so let it grow with the link.
+        advanced_http.experimental_http2_adaptive_window = true;
+      };
+      services = {
+        cas = [ { cas_store = cas; } ];
+        ac = [
+          {
+            ac_store = "ac";
+            read_only = acReadOnly;
+          }
+        ];
+        bytestream = [ { cas_store = cas; } ];
+        capabilities = [ { } ];
+        health = { };
+      };
+    };
 
   settings = {
     stores = [
@@ -50,25 +80,34 @@ let
           cas_store.ref_store.name = "cas";
         };
       }
+      # The CAS as pull requests see it. Reads go to the CAS. Writes are read
+      # and discarded, so a pull request cannot fill the store.
+      {
+        name = "cas_read_only";
+        fast_slow = {
+          fast.noop = { };
+          slow.ref_store.name = "cas";
+          slow_direction = "read_only";
+        };
+      }
     ];
 
     servers = [
-      {
-        name = "client";
-        listener.http = {
-          socket_address = "0.0.0.0:${toString port}";
-          # Clients are about 100 ms away. A fixed window caps each upload
-          # stream at window / RTT, so let it grow with the link.
-          advanced_http.experimental_http2_adaptive_window = true;
-        };
-        services = {
-          cas = [ { cas_store = "cas"; } ];
-          ac = [ { ac_store = "ac"; } ];
-          bytestream = [ { cas_store = "cas"; } ];
-          capabilities = [ { } ];
-          health = { };
-        };
-      }
+      (server {
+        name = "trusted";
+        port = trustedPort;
+        cas = "cas";
+        acReadOnly = false;
+      })
+      # Pull request jobs run code from the pull request and join as
+      # tag:ci-pr, which the tailnet policy admits only to this port. The
+      # server, not the client's Buck2 config, keeps them from writing.
+      (server {
+        name = "pull_request";
+        port = pullRequestPort;
+        cas = "cas_read_only";
+        acReadOnly = true;
+      })
     ];
 
     global.max_open_files = 24576;
@@ -124,7 +163,10 @@ in
     };
   };
 
-  # Only tailnet devices reach the cache. The Hetzner firewall drops the port
+  # Only tailnet devices reach the cache. The Hetzner firewall drops the ports
   # from the internet as well.
-  networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ port ];
+  networking.firewall.interfaces.tailscale0.allowedTCPPorts = [
+    trustedPort
+    pullRequestPort
+  ];
 }
