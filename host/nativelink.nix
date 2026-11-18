@@ -26,10 +26,15 @@ let
       # Sized to leave the 100 GB volume room for the action cache, temporary
       # files and the filesystem. Every upload is hashed and sized before it is
       # stored, so a client cannot place bytes under a digest they do not have.
+      # Build outputs compress about 2.3x with LZ4, and the limit counts the
+      # compressed bytes on disk. Changing this layout means clearing the CAS.
       {
         name = "cas";
         verify = {
-          backend.filesystem = filesystem "cas" (gib 85);
+          backend.compression = {
+            compression_algorithm.lz4 = { };
+            backend.filesystem = filesystem "cas" (gib 85);
+          };
           verify_size = true;
           verify_hash = true;
         };
@@ -50,7 +55,12 @@ let
     servers = [
       {
         name = "client";
-        listener.http.socket_address = "0.0.0.0:${toString port}";
+        listener.http = {
+          socket_address = "0.0.0.0:${toString port}";
+          # Clients are about 100 ms away. A fixed window caps each upload
+          # stream at window / RTT, so let it grow with the link.
+          advanced_http.experimental_http2_adaptive_window = true;
+        };
         services = {
           cas = [ { cas_store = "cas"; } ];
           ac = [ { ac_store = "ac"; } ];
